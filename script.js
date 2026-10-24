@@ -745,31 +745,46 @@ function openUploadModal() {
 function openTemplateModal(template) {
   activeTemplate = template;
   const fields = template.fields.map(([name, label, type]) => `<label class="form-field">${escapeHTML(label)}${type === 'textarea' ? `<textarea name="${escapeHTML(name)}" required></textarea>` : `<input name="${escapeHTML(name)}" type="${type || 'text'}" required>`}</label>`).join('');
-  openModal(`<span class="demo-label">ДЕМО-ШАБЛОН</span><h2 id="modalTitle">${escapeHTML(template.title)}</h2><p>Заполните обязательные поля. Будет сформирован текстовый черновик .txt.</p><form id="templateForm"><div class="template-form-grid">${fields}</div><div class="preview-content" id="templatePreview" hidden></div><div class="modal-actions"><button class="secondary-action" type="button" data-modal-close>Отмена</button><button class="secondary-action" type="button" id="previewTemplate">Предварительный просмотр</button><button class="primary-button" type="button" id="downloadTemplate">Сформировать документ</button></div></form>`, () => {
+  openModal(`<span class="demo-label">ДЕМО-ШАБЛОН</span><h2 id="modalTitle">${escapeHTML(template.title)}</h2><p>Заполните обязательные поля. Будет сформирован документ DOCX.</p><form id="templateForm"><div class="template-form-grid">${fields}</div><div class="preview-content" id="templatePreview" hidden></div><div class="modal-actions"><button class="secondary-action" type="button" data-modal-close>Отмена</button><button class="secondary-action" type="button" id="previewTemplate">Предварительный просмотр</button><button class="primary-button" type="button" id="downloadTemplate">Сформировать документ</button></div></form>`, () => {
     document.getElementById('previewTemplate').addEventListener('click', () => {
       if (!validateTemplateForm()) return;
       const preview = document.getElementById('templatePreview');
       preview.textContent = buildTemplateText();
       preview.hidden = false;
     });
-    document.getElementById('downloadTemplate').addEventListener('click', () => {
+    document.getElementById('downloadTemplate').addEventListener('click', async () => {
       if (!validateTemplateForm()) return;
-      const content = buildTemplateText();
+      const form = document.getElementById('templateForm');
+      const values = Object.fromEntries(new FormData(form).entries());
+      const payload = {
+        title: template.title,
+        fields: template.fields.map(([name]) => name),
+        values
+      };
       try {
-        const blob = new Blob([content], { type: 'text/plain;charset=utf-8' });
+        const response = await fetch('/api/templates/docx', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload)
+        });
+        const blob = await response.blob();
+        if (!response.ok) {
+          const error = await blob.text();
+          throw new Error(error || 'Не удалось сформировать DOCX.');
+        }
         const url = URL.createObjectURL(blob);
         const anchor = document.createElement('a');
         anchor.href = url;
-        anchor.download = `${template.title.toLocaleLowerCase('ru').replace(/[^\p{L}\p{N}]+/gu, '-')}.txt`;
+        anchor.download = `${template.title.toLocaleLowerCase('ru').replace(/[^\p{L}\p{N}]+/gu, '-')}.docx`;
         document.body.append(anchor);
         anchor.click();
         anchor.remove();
         window.setTimeout(() => URL.revokeObjectURL(url), 1000);
         closeModal();
-        showToast('Текстовый черновик создан и скачан в формате TXT.');
+        showToast('Документ сформирован и скачан в формате DOCX.');
       } catch (error) {
-        console.error('Не удалось создать текстовый файл.', error);
-        showToast('Не удалось создать файл. Попробуйте ещё раз.', true);
+        console.error('Не удалось создать DOCX-файл.', error);
+        showToast(error instanceof Error ? error.message : 'Не удалось создать файл. Попробуйте ещё раз.', true);
       }
     });
   });
@@ -817,6 +832,7 @@ function confirmClearHistory() {
       closeModal();
       renderChat();
       renderHistory(document.getElementById('historySearch').value);
+      renderSidebarChatList();
       showToast('История диалогов очищена.');
     });
   });
@@ -880,7 +896,6 @@ document.querySelectorAll('[data-clear]').forEach((button) => {
   button.addEventListener('click', () => { input.value = ''; input.dispatchEvent(new Event('input')); input.focus(); });
 });
 document.getElementById('uploadDocumentButton').addEventListener('click', openUploadModal);
-document.getElementById('checkDocumentButton').addEventListener('click', openDocumentCheckModal);
 document.getElementById('manageAdminsButton').addEventListener('click', openAdminManagementModal);
 document.getElementById('helpButton').addEventListener('click', showHelpModal);
 document.getElementById('globalSearchButton').addEventListener('click', () => {
@@ -893,10 +908,29 @@ document.getElementById('globalSearchButton').addEventListener('click', () => {
   }
 });
 document.getElementById('attachButton').addEventListener('click', () => document.getElementById('chatFileInput').click());
-document.getElementById('chatFileInput').addEventListener('change', (event) => {
+document.getElementById('chatFileInput').addEventListener('change', async (event) => {
   const file = event.target.files[0];
-  if (file) showToast(`Файл «${file.name}» выбран. Отправка вложений в демонстрационном режиме недоступна.`);
-  event.target.value = '';
+  if (!file) return;
+  if (!/\.docx$/i.test(file.name)) {
+    showToast('В чате автоматически проверяется только DOCX. Для остальных типов файлов используйте обычный текстовый вопрос.', true);
+    event.target.value = '';
+    return;
+  }
+  try {
+    const form = new FormData();
+    form.append('file', file);
+    form.append('mode', 'spelling');
+    const response = await fetch('/api/documents/check', { method: 'POST', body: form });
+    const result = await response.json();
+    if (!response.ok) throw new Error(result.detail || 'Не удалось проверить документ.');
+    if (typeof result.answer !== 'string' || !result.answer.trim()) throw new Error('Сервер вернул пустой отчёт.');
+    appendCheckReport(file.name, result);
+    showToast('DOCX проверен и добавлен в текущий чат.');
+  } catch (error) {
+    showToast(error instanceof Error ? error.message : 'Не удалось проверить документ.', true);
+  } finally {
+    event.target.value = '';
+  }
 });
 document.getElementById('emojiButton').addEventListener('click', () => {
   const input = document.getElementById('messageInput');

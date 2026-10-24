@@ -1,6 +1,7 @@
 import base64
 import hashlib
 import hmac
+import io
 import json
 import logging
 import math
@@ -16,10 +17,12 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Literal
 import uuid
+from urllib.parse import quote
 
 from dotenv import load_dotenv
+from docx import Document
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, Response
 from langchain_qdrant import QdrantVectorStore
 from pydantic import BaseModel, Field
 from qdrant_client import QdrantClient
@@ -614,3 +617,102 @@ def styles():
 @app.get("/script.js")
 def script():
     return FileResponse(APP_DIR / "script.js", media_type="application/javascript")
+
+
+@app.get("/api/templates/{template_name}")
+def get_template(request: Request, template_name: str):
+    _current_user(request)
+    if template_name == "requirements":
+        doc = Document()
+        doc.add_paragraph("Требования к документу:")
+        doc.add_paragraph("- Соответствие внутренним стандартам компании")
+        doc.add_paragraph("- Наличие всех обязательных разделов")
+        doc.add_paragraph("- Запрещено использование персональных данных без согласия")
+        doc.add_paragraph("- Документ должен быть на русском языке")
+        doc.add_paragraph("- Шрифт: Times New Roman, 14pt")
+        doc.add_paragraph("- Междустрочный интервал: 1.5")
+        doc.add_paragraph("- Поля: 2 см со всех сторон")
+        doc.add_paragraph("- Нумерация страниц внизу по центру")
+        doc.add_paragraph("- Содержание должно быть обновлено")
+        doc.add_paragraph("- Все ссылки должны быть активными")
+        doc.add_paragraph("- Размер файла не более 5 МБ")
+        doc.add_paragraph("- Формат файла DOCX")
+        buffer = io.BytesIO()
+        doc.save(buffer)
+        buffer.seek(0)
+        return FileResponse(
+            buffer,
+            media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            filename="шаблон_требований.docx",
+        )
+    raise HTTPException(status_code=404, detail="Шаблон не найден.")
+
+
+def _safe_template_filename(title: str) -> str:
+    cleaned = re.sub(r"[^\w\s\-()]+", "", title, flags=re.UNICODE)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    ascii_name = cleaned.encode("ascii", "ignore").decode("ascii").strip()
+    ascii_name = re.sub(r"\s+", " ", ascii_name).strip() or "template"
+    candidate = ascii_name or "template"
+    return f"{candidate}.docx"
+
+
+def _content_disposition(filename: str) -> str:
+    ascii_name = filename.encode("ascii", "ignore").decode("ascii")
+    ascii_name = re.sub(r"\s+", " ", ascii_name).strip() or "document.docx"
+    if ascii_name == filename:
+        return f'attachment; filename="{ascii_name}"'
+    return f'attachment; filename="{ascii_name}"; filename*=UTF-8\'\'{quote(filename, safe="")}'
+
+
+def _normalize_template_fields(raw_fields: object) -> list[str]:
+    if not isinstance(raw_fields, list):
+        return []
+    fields: list[str] = []
+    for item in raw_fields:
+        if isinstance(item, str):
+            value = item.strip()
+            if value:
+                fields.append(value)
+        elif isinstance(item, dict):
+            value = str(item.get("name") or item.get("field") or item.get("label") or "").strip()
+            if value:
+                fields.append(value)
+    return fields
+
+
+def _build_template_docx(title: str, fields: list[str], values: dict[str, str]) -> bytes:
+    document = Document()
+    document.add_heading(title, level=1)
+    for field in fields:
+        label = str(field).strip()
+        if not label:
+            continue
+        field_value = values.get(label)
+        if field_value is None:
+            normalized_values = {str(key).strip().casefold(): str(value) for key, value in values.items()}
+            field_value = normalized_values.get(label.casefold(), "")
+        document.add_paragraph(f"{label}: {field_value}")
+    buffer = io.BytesIO()
+    document.save(buffer)
+    return buffer.getvalue()
+
+
+@app.post("/api/templates/docx")
+def create_template_docx(payload: dict):
+    title = str(payload.get("title", "")).strip()
+    if not title:
+        raise HTTPException(status_code=400, detail="Название шаблона обязательно.")
+    raw_fields = payload.get("fields", [])
+    if not isinstance(raw_fields, list) or not raw_fields:
+        raise HTTPException(status_code=400, detail="Нужно передать хотя бы одно поле шаблона.")
+    fields = _normalize_template_fields(raw_fields)
+    if not fields:
+        raise HTTPException(status_code=400, detail="Не удалось распознать поля шаблона.")
+    values = payload.get("values", {})
+    if not isinstance(values, dict):
+        raise HTTPException(status_code=400, detail="Значения полей должны быть словарём.")
+    clean_values = {str(key): str(value) for key, value in values.items()}
+    content = _build_template_docx(title, fields, clean_values)
+    filename = _safe_template_filename(title)
+    return Response(content=content, media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document", headers={"Content-Disposition": _content_disposition(filename)})
