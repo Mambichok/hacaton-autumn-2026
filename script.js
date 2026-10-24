@@ -148,6 +148,44 @@ function showToast(message, isError = false) {
   window.setTimeout(() => toast.remove(), 4200);
 }
 
+function showUndoToast(message, onUndo) {
+  const duration = 5000;
+  let secondsLeft = duration / 1000;
+  const toast = document.createElement('div');
+  toast.className = 'toast toast-with-action';
+
+  const text = document.createElement('span');
+  text.textContent = message;
+
+  const undoButton = document.createElement('button');
+  undoButton.className = 'toast-undo-button';
+  undoButton.type = 'button';
+  undoButton.textContent = `Отменить · ${secondsLeft}`;
+  undoButton.setAttribute('aria-label', `Отменить действие, доступно ${secondsLeft} секунд`);
+
+  const dismiss = () => {
+    window.clearInterval(countdown);
+    window.clearTimeout(timeout);
+    toast.remove();
+  };
+
+  undoButton.addEventListener('click', () => {
+    dismiss();
+    onUndo();
+  });
+  toast.append(text, undoButton);
+  document.getElementById('toastRegion').append(toast);
+
+  const countdown = window.setInterval(() => {
+    secondsLeft -= 1;
+    if (secondsLeft > 0) {
+      undoButton.textContent = `Отменить · ${secondsLeft}`;
+      undoButton.setAttribute('aria-label', `Отменить действие, доступно ${secondsLeft} секунд`);
+    }
+  }, 1000);
+  const timeout = window.setTimeout(dismiss, duration);
+}
+
 function setScreen(name) {
   document.querySelectorAll('.screen').forEach((screen) => screen.classList.toggle('active', screen.id === `screen-${name}`));
   document.querySelectorAll('.nav-item').forEach((button) => button.classList.toggle('active', button.dataset.section === name));
@@ -346,10 +384,21 @@ function confirmDeleteTemplate(templateIndex) {
   openModal(`<h2 id="modalTitle">Удалить шаблон?</h2><p>Шаблон «${escapeHTML(template.title)}» будет удалён из демонстрационного интерфейса этого браузера.</p><div class="modal-actions"><button class="secondary-action" type="button" data-modal-close>Отмена</button><button class="primary-button danger-button" type="button" id="confirmDeleteTemplate">Удалить</button></div>`, () => {
     document.getElementById('confirmDeleteTemplate').addEventListener('click', () => {
       TEMPLATES.splice(templateIndex, 1);
-      if (!persistTemplates()) return;
+      if (!persistTemplates()) {
+        TEMPLATES.splice(templateIndex, 0, template);
+        return;
+      }
       closeModal();
       renderTemplates(document.getElementById('templateSearch').value);
-      showToast('Шаблон удалён из демонстрационного интерфейса.');
+      showUndoToast('Шаблон удалён.', () => {
+        TEMPLATES.splice(Math.min(templateIndex, TEMPLATES.length), 0, template);
+        if (!persistTemplates()) {
+          TEMPLATES.splice(TEMPLATES.indexOf(template), 1);
+          return;
+        }
+        renderTemplates(document.getElementById('templateSearch').value);
+        showToast('Удаление шаблона отменено.');
+      });
     });
   });
 }
@@ -496,12 +545,30 @@ function confirmDeleteDialog(id) {
   if (!dialog) return;
   openModal(`<h2 id="modalTitle">Удалить диалог?</h2><p>Диалог «${escapeHTML(dialog.title)}» будет удалён из истории этого браузера.</p><div class="modal-actions"><button class="secondary-action" type="button" data-modal-close>Отмена</button><button class="primary-button danger-button" type="button" id="confirmDelete">Удалить</button></div>`, () => {
     document.getElementById('confirmDelete').addEventListener('click', () => {
-      dialogs = dialogs.filter((item) => item.id !== id);
-      if (currentDialogId === id) currentDialogId = dialogs[0]?.id ?? null;
-      persistDialogs();
+      const dialogIndex = dialogs.findIndex((item) => item.id === id);
+      const previousCurrentDialogId = currentDialogId;
+      const wasCurrentDialog = currentDialogId === id;
+      dialogs.splice(dialogIndex, 1);
+      if (wasCurrentDialog) currentDialogId = dialogs[0]?.id ?? null;
+      if (!persistDialogs()) {
+        dialogs.splice(dialogIndex, 0, dialog);
+        currentDialogId = previousCurrentDialogId;
+        return;
+      }
       closeModal();
       renderHistory(document.getElementById('historySearch').value);
-      showToast('Диалог удалён из демонстрационной истории.');
+      showUndoToast('Диалог удалён.', () => {
+        const currentDialogBeforeUndo = currentDialogId;
+        dialogs.splice(Math.min(dialogIndex, dialogs.length), 0, dialog);
+        if (wasCurrentDialog) currentDialogId = id;
+        if (!persistDialogs()) {
+          dialogs.splice(dialogs.indexOf(dialog), 1);
+          currentDialogId = currentDialogBeforeUndo;
+          return;
+        }
+        renderHistory(document.getElementById('historySearch').value);
+        showToast('Удаление диалога отменено.');
+      });
     });
   });
 }
@@ -545,11 +612,6 @@ document.getElementById('chatFileInput').addEventListener('change', (event) => {
   const file = event.target.files[0];
   if (file) showToast(`Файл «${file.name}» выбран. Отправка вложений в демонстрационном режиме недоступна.`);
   event.target.value = '';
-});
-document.getElementById('emojiButton').addEventListener('click', () => {
-  const input = document.getElementById('messageInput');
-  input.value += '🙂';
-  input.focus();
 });
 document.getElementById('profileButton').addEventListener('click', () => {
   const menu = document.getElementById('profileMenu');
