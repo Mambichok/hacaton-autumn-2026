@@ -1,0 +1,140 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#f5f8fc">
+  <title>Интеллектуальный помощник — Банк Центр-Инвест</title>
+  <link rel="stylesheet" href="styles.css">
+  <script src="script.js" defer></script>
+</head>
+<body>
+  <div class="app-shell">
+    <button class="mobile-menu-backdrop" id="menuBackdrop" aria-label="Закрыть меню"></button>
+    <aside class="sidebar" id="sidebar" aria-label="Главная навигация">
+      <div class="sidebar-top">
+        <button class="brand" type="button" data-section="chat" aria-label="Банк Центр-Инвест, главная">
+          <span class="brand-mark" aria-hidden="true">Ц</span>
+          <span>Банк Центр-Инвест</span>
+        </button>
+        <button class="new-chat-button" id="newChatButton">
+          <span class="plus-icon" aria-hidden="true">+</span>
+          <span>Новый диалог</span>
+        </button>
+        <nav class="main-nav">
+          <button class="nav-item active" data-section="chat">
+            <span class="nav-icon" data-icon="chat"></span><span>Чат</span>
+          </button>
+          <button class="nav-item" data-section="documents">
+            <span class="nav-icon" data-icon="document"></span><span>Документы и регламенты</span>
+          </button>
+          <button class="nav-item" data-section="templates">
+            <span class="nav-icon" data-icon="template"></span><span>Шаблоны документов</span>
+          </button>
+          <button class="nav-item" data-section="history">
+            <span class="nav-icon" data-icon="history"></span><span>История</span>
+          </button>
+        </nav>
+      </div>
+      <button class="profile-button" id="profileButton" aria-expanded="false">
+        <span class="avatar" aria-hidden="true">АС</span>
+        <span class="profile-copy"><strong>Иванова Анна Сергеевна</strong><small>Специалист по клиентскому обслуживанию</small></span>
+        <span class="chevron" aria-hidden="true">›</span>
+      </button>
+      <div class="profile-menu" id="profileMenu" hidden>
+        <strong>Иванова Анна Сергеевна</strong>
+        <span>Специалист по клиентскому обслуживанию</span>
+        <button id="exitDemoButton">Выйти из демонстрационного режима</button>
+      </div>
+    </aside>
+
+    <main class="main-area">
+      <header class="topbar">
+        <button class="mobile-menu-button icon-button" id="mobileMenuButton" aria-label="Открыть меню">
+          <span data-icon="menu"></span>
+        </button>
+        <div class="page-heading">
+          <span class="heading-icon" id="headingIcon" data-icon="sparkle"></span>
+          <div>
+            <h1 id="pageTitle">Интеллектуальный помощник по регламентам</h1>
+            <p class="page-subtitle" id="pageSubtitle"></p>
+          </div>
+        </div>
+        <div class="topbar-actions">
+          <span class="topbar-hint">Быстрый доступ к правилам, регламентам и шаблонам</span>
+          <button class="icon-button" id="globalSearchButton" aria-label="Поиск" title="Найти на странице">
+            <span data-icon="search"></span>
+          </button>
+          <button class="icon-button help-button" id="helpButton" aria-label="Справка" title="Справка">
+            <span class="help-mark">?</span>
+          </button>
+        </div>
+      </header>
+
+      <section class="screen chat-screen active" id="screen-chat" aria-label="Чат">
+        <div class="chat-content" id="chatContent" aria-live="polite"></div>
+        <div class="composer-wrap">
+          <div class="reading-mode"><span data-icon="eye"></span>Режим чтения</div>
+          <form class="composer" id="chatForm">
+            <label class="sr-only" for="messageInput">Ваш вопрос</label>
+            <textarea id="messageInput" rows="2" placeholder="Задайте вопрос об актуальных регламентах, документах или шаблонах.&#10;Я помогу найти нужную информацию."></textarea>
+            <div class="composer-tools">
+              <div class="composer-attachments">
+                <input id="chatFileInput" type="file" hidden>
+                <button class="subtle-icon-button" type="button" id="attachButton" aria-label="Прикрепить файл" title="Прикрепить файл"><span data-icon="paperclip"></span></button>
+                <button class="subtle-icon-button" type="button" id="emojiButton" aria-label="Добавить смайлик" title="Добавить смайлик">☺</button>
+              </div>
+              <button class="send-button" type="submit" aria-label="Отправить сообщение"><span data-icon="send"></span></button>
+            </div>
+          </form>
+        </div>
+      </section>
+
+      <section class="screen documents-screen" id="screen-documents" aria-label="Документы и регламенты">
+        <div class="section-toolbar">
+          <div class="search-field">
+            <span data-icon="search"></span>
+            <input type="search" id="documentSearch" placeholder="Поиск по названию документа, номеру пункта, ключевым словам..." aria-label="Поиск документов">
+            <button class="clear-search" data-clear="documentSearch" aria-label="Очистить поиск" hidden>×</button>
+          </div>
+          <button class="secondary-button upload-button" id="uploadDocumentButton"><span data-icon="lock"></span>Загрузить документ</button>
+        </div>
+        <div class="document-grid" id="documentGrid"></div>
+        <p class="empty-state" id="documentsEmpty" hidden>По вашему запросу документы не найдены.</p>
+      </section>
+
+      <section class="screen templates-screen" id="screen-templates" aria-label="Шаблоны документов">
+        <div class="templates-toolbar">
+          <div class="search-field template-search">
+            <span data-icon="search"></span>
+            <input type="search" id="templateSearch" placeholder="Поиск по шаблонам документов..." aria-label="Поиск шаблонов">
+            <button class="clear-search" data-clear="templateSearch" aria-label="Очистить поиск" hidden>×</button>
+          </div>
+        </div>
+        <div class="template-grid" id="templateGrid"></div>
+        <p class="empty-state" id="templatesEmpty" hidden>Шаблоны по вашему запросу не найдены.</p>
+      </section>
+
+      <section class="screen history-screen" id="screen-history" aria-label="История диалогов">
+        <div class="history-toolbar">
+          <div class="search-field history-search">
+            <span data-icon="search"></span>
+            <input type="search" id="historySearch" placeholder="Поиск по истории диалогов..." aria-label="Поиск в истории">
+            <button class="clear-search" data-clear="historySearch" aria-label="Очистить поиск" hidden>×</button>
+          </div>
+        </div>
+        <div id="historyList"></div>
+      </section>
+    </main>
+  </div>
+
+  <div class="modal-layer" id="modalLayer" hidden>
+    <div class="modal-backdrop" data-modal-close></div>
+    <section class="modal-card" id="modalCard" role="dialog" aria-modal="true" aria-labelledby="modalTitle">
+      <button class="modal-close" id="modalCloseButton" aria-label="Закрыть окно">×</button>
+      <div id="modalContent"></div>
+    </section>
+  </div>
+  <div class="toast-region" id="toastRegion" aria-live="polite" aria-atomic="true"></div>
+</body>
+</html>
