@@ -31,10 +31,14 @@
           <button class="nav-item" data-section="templates">
             <span class="nav-icon" data-icon="template"></span><span>Шаблоны документов</span>
           </button>
-          <button class="nav-item" data-section="history">
-            <span class="nav-icon" data-icon="history"></span><span>История</span>
-          </button>
+          <div class="history-nav-row">
+            <button class="nav-item" data-section="history">
+              <span class="nav-icon" data-icon="history"></span><span>История</span>
+            </button>
+            <button class="chat-list-toggle" id="chatListToggle" type="button" aria-expanded="false" aria-controls="sidebarChatList" aria-label="Показать список чатов" title="Показать список чатов">⌄</button>
+          </div>
         </nav>
+        <div class="sidebar-chat-list" id="sidebarChatList" hidden></div>
       </div>
       <div class="sidebar-footer">
         <button class="profile-button" id="profileButton" aria-expanded="false">
@@ -81,6 +85,7 @@
         <div class="chat-content" id="chatContent" aria-live="polite"></div>
         <div class="composer-wrap">
           <div class="reading-mode"><span data-icon="eye"></span>Режим чтения</div>
+          <p class="privacy-notice">Сообщения и найденные фрагменты документов передаются внешнему AI-сервису. Не вводите персональные данные. Автоматическая проверка может обнаружить не все данные.</p>
           <form class="composer" id="chatForm">
             <label class="sr-only" for="messageInput">Ваш вопрос</label>
             <textarea id="messageInput" rows="2" placeholder="Задайте вопрос об актуальных регламентах, документах или шаблонах.&#10;Я помогу найти нужную информацию."></textarea>
@@ -88,6 +93,7 @@
               <div class="composer-attachments">
                 <input id="chatFileInput" type="file" hidden>
                 <button class="subtle-icon-button" type="button" id="attachButton" aria-label="Прикрепить файл" title="Прикрепить файл"><span data-icon="paperclip"></span></button>
+                <button class="subtle-icon-button" type="button" id="emojiButton" aria-label="Добавить смайлик" title="Добавить смайлик">☺</button>
               </div>
               <button class="send-button" type="submit" aria-label="Отправить сообщение"><span data-icon="send"></span></button>
             </div>
@@ -102,7 +108,8 @@
             <input type="search" id="documentSearch" placeholder="Поиск по названию документа, номеру пункта, ключевым словам..." aria-label="Поиск документов">
             <button class="clear-search" data-clear="documentSearch" aria-label="Очистить поиск" hidden>×</button>
           </div>
-          <button class="secondary-button upload-button" id="uploadDocumentButton"><span data-icon="lock"></span>Загрузить документ</button>
+          <button class="secondary-button" id="manageAdminsButton" type="button" hidden>Управление администраторами</button>
+          <button class="secondary-button upload-button" id="uploadDocumentButton" hidden><span data-icon="lock"></span>Загрузить документ</button>
         </div>
         <div class="document-grid" id="documentGrid"></div>
         <p class="empty-state" id="documentsEmpty" hidden>По вашему запросу документы не найдены.</p>
@@ -128,6 +135,11 @@
             <input type="search" id="historySearch" placeholder="Поиск по истории диалогов..." aria-label="Поиск в истории">
             <button class="clear-search" data-clear="historySearch" aria-label="Очистить поиск" hidden>×</button>
           </div>
+          <div class="history-protection">
+            <label class="history-saving-control"><input type="checkbox" id="historySavingToggle"><span>Сохранять историю на этом устройстве</span></label>
+            <small>При выключении текущая история будет удалена.</small>
+          </div>
+          <button class="secondary-button clear-history-button" id="clearHistoryButton" type="button">Очистить историю</button>
         </div>
         <div id="historyList"></div>
       </section>
