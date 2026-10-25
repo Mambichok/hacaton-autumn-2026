@@ -2,10 +2,11 @@ import json
 import sqlite3
 import tempfile
 import unittest
+import uuid
 from types import SimpleNamespace
 from io import BytesIO
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from docx import Document
 from langchain_core.documents import Document as SearchDocument
@@ -39,6 +40,14 @@ class TemplateFeatureTests(unittest.TestCase):
         paragraph.add_run("Сотрудник: {{empl")
         paragraph.add_run("oyee_name}}")
         document.add_paragraph("Дата: {{document_date}}")
+        output = BytesIO()
+        document.save(output)
+        return output.getvalue()
+
+    @staticmethod
+    def make_docx(text: str) -> bytes:
+        document = Document()
+        document.add_paragraph(text)
         output = BytesIO()
         document.save(output)
         return output.getvalue()
@@ -301,6 +310,295 @@ class TemplateFeatureTests(unittest.TestCase):
             response.headers["content-type"],
         )
 
+    def test_superadmin_can_delete_uploaded_document_and_reindex(self):
+        upload_directory = self.data_directory / "uploaded"
+        upload_directory.mkdir()
+        path = upload_directory / "policy.docx"
+        path.write_bytes(self.make_docx("Тестовый документ для удаления."))
+        application._set_document_metadata(path.name, "Тестовый документ")
+
+        with (
+            patch.object(application, "ORIGINAL_DIR", self.data_directory / "original"),
+            patch.object(application, "UPLOAD_DIR", upload_directory),
+            patch.object(
+                application,
+                "_current_user",
+                return_value={"username": "root", "role": "superadmin"},
+            ),
+            patch.object(application, "reindex_documents", return_value=2) as reindex,
+        ):
+            response = self.client.delete("/api/documents/policy.docx")
+
+        self.assertEqual(response.status_code, 204)
+        self.assertFalse(path.exists())
+        self.assertIsNone(application._get_document_metadata(path.name))
+        reindex.assert_called_once_with(
+            (self.data_directory / "original", upload_directory),
+            self.data_directory / "admins.sqlite3",
+        )
+
+    def test_document_delete_restores_file_when_reindex_fails(self):
+        upload_directory = self.data_directory / "uploaded"
+        upload_directory.mkdir()
+        path = upload_directory / "policy.docx"
+        original_content = self.make_docx("Тестовый документ для восстановления.")
+        path.write_bytes(original_content)
+        application._set_document_metadata(path.name, "Исходное название")
+
+        with (
+            patch.object(application, "ORIGINAL_DIR", self.data_directory / "original"),
+            patch.object(application, "UPLOAD_DIR", upload_directory),
+            patch.object(
+                application,
+                "_current_user",
+                return_value={"username": "root", "role": "superadmin"},
+            ),
+            patch.object(
+                application,
+                "reindex_documents",
+                side_effect=RuntimeError("Qdrant недоступен"),
+            ),
+        ):
+            response = self.client.delete("/api/documents/policy.docx")
+
+        self.assertEqual(response.status_code, 502)
+        self.assertEqual(path.read_bytes(), original_content)
+        self.assertEqual(
+            application._get_document_metadata(path.name)["title"],
+            "Исходное название",
+        )
+
+    def test_uploaded_document_uses_qdrant_compatible_point_ids(self):
+        upload_directory = self.data_directory / "uploaded"
+        vector_store = SimpleNamespace(add_texts=Mock())
+        with (
+            patch.object(application, "ORIGINAL_DIR", self.data_directory / "original"),
+            patch.object(application, "UPLOAD_DIR", upload_directory),
+            patch.object(application, "ensure_active_collection", return_value=True),
+            patch.object(application, "QdrantClient"),
+            patch.object(application, "get_embeddings", return_value=object()),
+            patch.object(
+                application.QdrantVectorStore,
+                "from_existing_collection",
+                return_value=vector_store,
+            ),
+        ):
+            response = self.client.post(
+                "/api/documents/upload",
+                files={
+                    "file": (
+                        "new-policy.docx",
+                        self.make_docx("Текст тестового регламента для индексации."),
+                        "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                    )
+                },
+                data={"title": "Тестовый регламент"},
+            )
+
+        self.assertEqual(response.status_code, 200, response.text)
+        call = vector_store.add_texts.call_args.kwargs
+        point_ids = call["ids"]
+        self.assertEqual(len(point_ids), response.json()["chunks"])
+        self.assertEqual(len(point_ids), len(set(point_ids)))
+        for point_id in point_ids:
+            self.assertEqual(str(uuid.UUID(point_id)), point_id)
+        self.assertEqual(
+            len({metadata["document_id"] for metadata in call["metadatas"]}),
+            1,
+        )
+
+    def test_admin_upload_cannot_override_original_document(self):
+        original_directory = self.data_directory / "original"
+        original_directory.mkdir()
+        original_content = self.make_docx("Утверждённая версия положения.")
+        (original_directory / "policy.docx").write_bytes(original_content)
+        upload_directory = self.data_directory / "uploaded"
+
+        with (
+            patch.object(application, "ORIGINAL_DIR", original_directory),
+            patch.object(application, "UPLOAD_DIR", upload_directory),
+            patch.object(application, "read_docx_bytes", return_value="Текст положения."),
+        ):
+            response = self.client.post(
+                "/api/documents/upload",
+                files={
+                    "file": (
+                        "policy.docx",
+                        self.make_docx("Неавторизованная замена."),
+                        "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                    )
+                },
+                data={"title": "Подмена названия"},
+            )
+
+        self.assertEqual(response.status_code, 409)
+        self.assertIn("супер-администратор", response.json()["detail"])
+        self.assertFalse((upload_directory / "policy.docx").exists())
+        self.assertEqual(
+            (original_directory / "policy.docx").read_bytes(),
+            original_content,
+        )
+
+    def test_superadmin_can_replace_document_and_change_its_title(self):
+        original_directory = self.data_directory / "original"
+        original_directory.mkdir()
+        path = original_directory / "policy.docx"
+        original_content = self.make_docx("Старая версия положения.")
+        path.write_bytes(original_content)
+        upload_directory = self.data_directory / "uploaded"
+        application._set_document_metadata(path.name, "Старое название")
+
+        with (
+            patch.object(application, "ORIGINAL_DIR", original_directory),
+            patch.object(application, "UPLOAD_DIR", upload_directory),
+            patch.object(
+                application,
+                "_current_user",
+                return_value={"username": "root", "role": "superadmin"},
+            ),
+            patch.object(application, "reindex_documents", return_value=2) as reindex,
+        ):
+            response = self.client.put(
+                "/api/documents/policy.docx",
+                files={
+                    "file": (
+                        "new-policy.docx",
+                        self.make_docx("Новая версия положения."),
+                        "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                    )
+                },
+                data={"title": "Новое название положения"},
+            )
+            listed = self.client.get("/api/documents")
+
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(
+            application.read_docx_bytes((upload_directory / path.name).read_bytes()),
+            "Новая версия положения.",
+        )
+        self.assertEqual(path.read_bytes(), original_content)
+        reindex.assert_called_once_with(
+            (original_directory, self.data_directory / "uploaded"),
+            self.data_directory / "admins.sqlite3",
+        )
+        self.assertEqual(response.json()["document"]["title"], "Новое название положения")
+        document = next(
+            item for item in listed.json()["documents"] if item["source"] == "policy.docx"
+        )
+        self.assertEqual(
+            sum(item["source"] == "policy.docx" for item in listed.json()["documents"]),
+            1,
+        )
+        self.assertEqual(document["title"], "Новое название положения")
+        self.assertEqual(document["date"], response.json()["document"]["date"])
+
+    def test_document_update_restores_previous_file_and_title_if_reindex_fails(self):
+        original_directory = self.data_directory / "original"
+        original_directory.mkdir()
+        path = original_directory / "policy.docx"
+        original_content = self.make_docx("Старая версия положения.")
+        path.write_bytes(original_content)
+        application._set_document_metadata(path.name, "Существующее название")
+
+        with (
+            patch.object(application, "ORIGINAL_DIR", original_directory),
+            patch.object(application, "UPLOAD_DIR", self.data_directory / "uploaded"),
+            patch.object(
+                application,
+                "_current_user",
+                return_value={"username": "root", "role": "superadmin"},
+            ),
+            patch.object(
+                application,
+                "reindex_documents",
+                side_effect=RuntimeError("Qdrant недоступен"),
+            ),
+        ):
+            response = self.client.put(
+                "/api/documents/policy.docx",
+                files={
+                    "file": (
+                        "new-policy.docx",
+                        self.make_docx("Новая версия положения."),
+                        "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                    )
+                },
+                data={"title": "Временное название"},
+            )
+
+        self.assertEqual(response.status_code, 502)
+        self.assertEqual(path.read_bytes(), original_content)
+        self.assertFalse((self.data_directory / "uploaded" / path.name).exists())
+        self.assertEqual(
+            application._get_document_metadata(path.name)["title"],
+            "Существующее название",
+        )
+
+    def test_document_update_keeps_existing_title_when_no_new_title_is_given(self):
+        original_directory = self.data_directory / "original"
+        original_directory.mkdir()
+        path = original_directory / "policy.docx"
+        path.write_bytes(self.make_docx("Старая версия положения."))
+        application._set_document_metadata(path.name, "Действующее название")
+
+        with (
+            patch.object(application, "ORIGINAL_DIR", original_directory),
+            patch.object(application, "UPLOAD_DIR", self.data_directory / "uploaded"),
+            patch.object(
+                application,
+                "_current_user",
+                return_value={"username": "root", "role": "superadmin"},
+            ),
+            patch.object(application, "reindex_documents", return_value=1),
+        ):
+            response = self.client.put(
+                "/api/documents/policy.docx",
+                files={
+                    "file": (
+                        "replacement.docx",
+                        self.make_docx("Новая версия положения."),
+                        "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                    )
+                },
+                data={"title": ""},
+            )
+
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()["document"]["title"], "Действующее название")
+
+    def test_regular_admin_cannot_update_documents(self):
+        original_directory = self.data_directory / "original"
+        original_directory.mkdir()
+        path = original_directory / "policy.docx"
+        original_content = self.make_docx("Старая версия положения.")
+        path.write_bytes(original_content)
+
+        with (
+            patch.object(application, "ORIGINAL_DIR", original_directory),
+            patch.object(application, "UPLOAD_DIR", self.data_directory / "uploaded"),
+            patch.object(
+                application,
+                "_current_user",
+                return_value={"username": "admin", "role": "admin"},
+            ),
+            patch.object(application, "reindex_documents") as reindex,
+        ):
+            response = self.client.put(
+                "/api/documents/policy.docx",
+                files={
+                    "file": (
+                        "new-policy.docx",
+                        self.make_docx("Новая версия положения."),
+                        "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                    )
+                },
+                data={"title": "Новое название"},
+            )
+
+        self.assertEqual(response.status_code, 403)
+        self.assertEqual(path.read_bytes(), original_content)
+        reindex.assert_not_called()
+
     def test_empty_document_list_explains_missing_source_files_and_is_not_cached(self):
         with (
             patch.object(application, "ORIGINAL_DIR", self.data_directory / "missing-original"),
@@ -442,10 +740,11 @@ class TemplateFeatureTests(unittest.TestCase):
         originals.mkdir()
         uploads.mkdir()
         original_docx = originals / "policy.docx"
+        override_docx = uploads / "policy.docx"
         uploaded_pdf = uploads / "notice.pdf"
         uploaded_docx = uploads / "memo.docx"
         ignored = uploads / "notes.txt"
-        for file in (original_docx, uploaded_pdf, uploaded_docx, ignored):
+        for file in (original_docx, override_docx, uploaded_pdf, uploaded_docx, ignored):
             file.write_bytes(b"test")
 
         with (
@@ -458,6 +757,7 @@ class TemplateFeatureTests(unittest.TestCase):
             {file.name for file in files},
             {"policy.docx", "notice.pdf", "memo.docx"},
         )
+        self.assertEqual(next(file for file in files if file.name == "policy.docx"), override_docx)
 
     def test_chat_uses_longer_history_without_embedding_the_entire_history(self):
         source = SearchDocument(
@@ -487,6 +787,32 @@ class TemplateFeatureTests(unittest.TestCase):
         self.assertIn("История диалога 11", call_model.call_args.args[1])
         self.assertEqual(result["answer"], "Ответ")
         self.assertEqual(result["sources"][0]["title"], "procedure.docx")
+
+    def test_chat_ignores_qdrant_chunks_for_deleted_files(self):
+        deleted_source = SearchDocument(
+            page_content="Удалённый документ утверждает, что тестовый код — OLD-1.",
+            metadata={
+                "source": "deleted.docx",
+                "file_path": str(self.data_directory / "deleted.docx"),
+            },
+        )
+
+        class SearchStore:
+            def similarity_search_with_relevance_scores(self, query, k):
+                return [(deleted_source, 0.99)]
+
+        with (
+            patch("ask_bot.get_vector_store", return_value=SearchStore()),
+            patch("ask_bot._call_model") as call_model,
+        ):
+            result = ask_bot("Какой тестовый код?")
+
+        self.assertEqual(
+            result["answer"],
+            "В доступных мне документах нет информации по этому вопросу.",
+        )
+        self.assertEqual(result["sources"], [])
+        call_model.assert_not_called()
 
     def test_document_review_searches_several_document_sections(self):
         class SearchStore:

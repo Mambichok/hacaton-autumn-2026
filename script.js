@@ -352,8 +352,58 @@ function renderDocuments(filter = '') {
   const grid = document.getElementById('documentGrid');
   const normalized = filter.trim().toLocaleLowerCase('ru');
   const documents = [...UPLOADED_DOCUMENTS, ...DOCUMENTS].filter((doc) => `${doc.title} ${doc.description}`.toLocaleLowerCase('ru').includes(normalized));
-  grid.innerHTML = documents.map((doc) => `<article class="document-card"><span class="file-icon">${icon('file')}<span class="file-label">${escapeHTML(doc.source?.split('.').pop()?.toUpperCase() || 'PDF')}</span></span><h2>${escapeHTML(doc.title)}</h2><p>${escapeHTML(doc.description)}</p><div class="document-meta">${icon('calendar')}Обновлено ${escapeHTML(doc.date)}</div><a class="primary-button" href="/api/documents/${encodeURIComponent(doc.source)}/view" target="_blank" rel="noopener">${icon('external')}Читать</a></article>`).join('');
+  grid.innerHTML = documents.map((doc) => {
+    const viewLink = `<a class="primary-button" href="/api/documents/${encodeURIComponent(doc.source)}/view" target="_blank" rel="noopener">${icon('external')}Читать</a>`;
+    const isSuperAdmin = adminRole === 'superadmin';
+    const canEdit = isSuperAdmin && doc.source.toLowerCase().endsWith('.docx');
+    const canDelete = isSuperAdmin && doc.uploaded;
+    const editButton = canEdit
+      ? `<button class="secondary-button document-edit-button" type="button" data-edit-document="${escapeHTML(doc.source)}">${icon('edit')}Обновить</button>`
+      : '';
+    const deleteButton = canDelete
+      ? `<button class="secondary-button document-delete-button" type="button" data-delete-document="${escapeHTML(doc.source)}">${icon('trash')}Удалить</button>`
+      : '';
+    const actions = canEdit || canDelete
+      ? `<div class="document-actions">${viewLink}${editButton}${deleteButton}</div>`
+      : viewLink;
+    return `<article class="document-card"><span class="file-icon">${icon('file')}<span class="file-label">${escapeHTML(doc.source.split('.').pop().toUpperCase())}</span></span><h2>${escapeHTML(doc.title)}</h2><p>${escapeHTML(doc.description)}</p><div class="document-meta">${icon('calendar')}Обновлено ${escapeHTML(doc.date)}</div>${actions}</article>`;
+  }).join('');
   document.getElementById('documentsEmpty').hidden = documents.length > 0;
+  grid.querySelectorAll('[data-edit-document]').forEach((button) => {
+    button.addEventListener('click', () => {
+      const documentToEdit = documents.find(
+        (doc) => doc.source === button.dataset.editDocument,
+      );
+      if (documentToEdit) openDocumentUpdateModal(documentToEdit);
+    });
+  });
+  grid.querySelectorAll('[data-delete-document]').forEach((button) => {
+    button.addEventListener('click', async () => {
+      const source = button.dataset.deleteDocument;
+      const documentToDelete = documents.find((doc) => doc.source === source);
+      if (!documentToDelete || adminRole !== 'superadmin') return;
+      if (!window.confirm(`Удалить загруженный документ «${documentToDelete.title}» и убрать его из поиска?`)) return;
+      button.disabled = true;
+      try {
+        const response = await fetch(`/api/documents/${encodeURIComponent(source)}`, {
+          method: 'DELETE'
+        });
+        const result = response.status === 204 ? {} : await response.json();
+        if (!response.ok) throw new Error(result.detail || 'Не удалось удалить документ.');
+        const listResponse = await fetch('/api/documents', { cache: 'no-store' });
+        const listResult = await listResponse.json();
+        if (!listResponse.ok || !Array.isArray(listResult.documents)) {
+          throw new Error(listResult.detail || 'Документ удалён, но список документов не удалось обновить. Перезагрузите страницу.');
+        }
+        UPLOADED_DOCUMENTS.splice(0, UPLOADED_DOCUMENTS.length, ...listResult.documents);
+        renderDocuments(document.getElementById('documentSearch').value);
+        showToast('Документ удалён из базы и поиска.');
+      } catch (error) {
+        showToast(error instanceof Error ? error.message : 'Не удалось удалить документ.', true);
+        button.disabled = false;
+      }
+    });
+  });
 }
 
 function renderTemplates(filter = '') {
@@ -714,6 +764,44 @@ function appendCheckReport(filename, result) {
   renderChat();
 }
 
+function openDocumentUpdateModal(doc) {
+  if (adminRole !== 'superadmin') {
+    showToast('Обновлять документы может только супер-администратор.', true);
+    return;
+  }
+  openModal(`<h2 id="modalTitle">Обновить документ</h2><p>Загрузите новую версию DOCX. Название можно оставить без изменений или отредактировать. После загрузки документ будет переиндексирован для поиска в чате.</p><label class="form-field">Название документа<input id="updateDocumentTitle" type="text" maxlength="200" value="${escapeHTML(doc.title)}" required></label><label class="form-field">Новый файл DOCX<input id="updateDocumentFile" type="file" accept=".docx,application/vnd.openxmlformats-officedocument.wordprocessingml.document" required></label><div class="modal-actions"><button class="secondary-action" type="button" data-modal-close>Отмена</button><button class="primary-button" type="button" id="confirmDocumentUpdate">Заменить и переиндексировать</button></div>`, () => {
+    document.getElementById('confirmDocumentUpdate').addEventListener('click', async (event) => {
+      const file = document.getElementById('updateDocumentFile').files[0];
+      if (!file) { showToast('Выберите новый файл DOCX.', true); return; }
+      if (!/\.docx$/i.test(file.name)) { showToast('Для обновления выберите файл DOCX.', true); return; }
+      const button = event.currentTarget;
+      button.disabled = true;
+      button.textContent = 'Переиндексирую...';
+      try {
+        const form = new FormData();
+        form.append('file', file);
+        form.append('title', document.getElementById('updateDocumentTitle').value.trim());
+        const response = await fetch(`/api/documents/${encodeURIComponent(doc.source)}`, {
+          method: 'PUT',
+          body: form
+        });
+        const result = await response.json();
+        if (!response.ok) throw new Error(result.detail || 'Не удалось обновить документ.');
+        const index = UPLOADED_DOCUMENTS.findIndex((item) => item.source === doc.source);
+        if (index >= 0) UPLOADED_DOCUMENTS[index] = result.document;
+        else UPLOADED_DOCUMENTS.push(result.document);
+        renderDocuments(document.getElementById('documentSearch').value);
+        closeModal();
+        showToast(result.message);
+      } catch (error) {
+        showToast(error instanceof Error ? error.message : 'Не удалось обновить документ.', true);
+        button.disabled = false;
+        button.textContent = 'Заменить и переиндексировать';
+      }
+    });
+  });
+}
+
 function openDocumentCheckModal() {
   openModal(`<h2 id="modalTitle">Проверить документ DOCX</h2><p>Файл будет проверен по загруженным документам и регламентам. Результат появится в отдельном новом диалоге.</p><label class="form-field">Документ<input id="checkDocumentFile" type="file" accept=".docx,application/vnd.openxmlformats-officedocument.wordprocessingml.document" required></label><div class="modal-actions"><button class="secondary-action" type="button" data-modal-close>Отмена</button><button class="primary-button" type="button" id="checkRequirementsButton">Проверить по базе</button></div>`, () => {
     document.getElementById('checkRequirementsButton').addEventListener('click', async (event) => {
@@ -750,6 +838,7 @@ function syncAdminUI(user = null) {
   button.querySelector('span:last-child').textContent = isAdminMode ? 'Выйти из режима администратора' : 'Вход администратора';
   document.getElementById('uploadDocumentButton').hidden = !isAdminMode;
   document.getElementById('manageAdminsButton').hidden = adminRole !== 'superadmin';
+  renderDocuments(document.getElementById('documentSearch').value);
   renderTemplates(document.getElementById('templateSearch').value);
 }
 

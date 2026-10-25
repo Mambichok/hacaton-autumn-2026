@@ -347,6 +347,9 @@ h1 { margin: 0; font-size: 20px; line-height: 1.25; font-weight: 700; letter-spa
 .primary-button svg { width: 15px; height: 15px; }
 .document-actions { display: flex; align-items: stretch; gap: 8px; margin-top: 12px; }
 .document-actions .primary-button { flex: 1; margin: 0; }
+.document-actions .secondary-button { min-width: 0; min-height: 33px; flex: 1; justify-content: center; margin: 0; padding: 0 8px; }
+.document-actions .secondary-button svg { flex: 0 0 auto; }
+.document-actions .document-delete-button:hover { color: #a4343e; border-color: #edc5c8; background: #fff1f1; }
 .admin-list { display: grid; gap: 8px; margin-top: 18px; }
 .admin-list-item { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 10px; border: 1px solid var(--line); border-radius: 8px; }
 .admin-list-item span { min-width: 0; display: grid; gap: 4px; }
@@ -490,6 +493,7 @@ html[data-theme="dark"] .documents-screen,
 html[data-theme="dark"] .templates-screen { background: #151d28; }
 html[data-theme="dark"] .documents-screen .section-toolbar .secondary-button { border-color: #3479d5; background: #3479d5; color: #fff; }
 html[data-theme="dark"] .documents-screen .section-toolbar .secondary-button:hover { border-color: #4389e3; background: #4389e3; }
+html[data-theme="dark"] .document-actions .document-delete-button:hover { color: #ffb3bb; border-color: #74414a; background: #452a32; }
 html[data-theme="dark"] .profile-menu,
 html[data-theme="dark"] .source-help-button,
 html[data-theme="dark"] .source-popover,

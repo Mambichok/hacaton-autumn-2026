@@ -40,6 +40,7 @@ from index_documents import (
     ensure_active_collection,
     read_docx_bytes,
     read_pdf_bytes,
+    reindex_documents,
 )
 
 load_dotenv()
@@ -61,6 +62,7 @@ ADMIN_DATABASE = Path(
 )
 MAX_UPLOAD_SIZE = int(os.getenv("MAX_UPLOAD_SIZE_MB", "20")) * 1024 * 1024
 ALLOWED_EXTENSIONS = {".docx", ".pdf"}
+DOCUMENT_INDEX_LOCK = threading.Lock()
 SESSION_COOKIE = "assistant_session"
 SESSION_DURATION_SECONDS = 8 * 60 * 60
 SENSITIVE_DATA_PATTERNS = (
@@ -231,6 +233,13 @@ def _connect_admin_database() -> sqlite3.Connection:
             created_at TEXT NOT NULL
         )"""
     )
+    connection.execute(
+        """CREATE TABLE IF NOT EXISTS document_metadata (
+            source TEXT PRIMARY KEY,
+            title TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        )"""
+    )
     template_columns = {
         column["name"]
         for column in connection.execute("PRAGMA table_info(templates)")
@@ -337,7 +346,7 @@ def _require_superadmin(request: Request) -> dict[str, str]:
     if user["role"] != "superadmin":
         raise HTTPException(
             status_code=403,
-            detail="Управлять администраторами может только супер-администратор.",
+            detail="Эта операция доступна только супер-администратору.",
         )
     return user
 
@@ -345,11 +354,59 @@ def _require_superadmin(request: Request) -> dict[str, str]:
 def _source_file(filename: str) -> Path:
     if not _is_safe_document_filename(filename):
         raise HTTPException(status_code=400, detail="Некорректное имя файла.")
-    for directory in (ORIGINAL_DIR, UPLOAD_DIR):
+    for directory in (UPLOAD_DIR, ORIGINAL_DIR):
         candidate = directory / filename
         if candidate.is_file():
             return candidate
     raise HTTPException(status_code=404, detail="Документ не найден.")
+
+
+def _get_document_metadata(source: str) -> dict[str, str] | None:
+    with _admin_database() as connection:
+        row = connection.execute(
+            "SELECT title, updated_at FROM document_metadata WHERE source = ?",
+            (source,),
+        ).fetchone()
+    return dict(row) if row else None
+
+
+def _set_document_metadata(source: str, title: str) -> None:
+    updated_at = datetime.now().strftime("%d.%m.%Y")
+    with _admin_database() as connection:
+        connection.execute(
+            """INSERT INTO document_metadata (source, title, updated_at)
+            VALUES (?, ?, ?)
+            ON CONFLICT(source) DO UPDATE SET
+                title = excluded.title,
+                updated_at = excluded.updated_at""",
+            (source, title, updated_at),
+        )
+
+
+def _restore_document_metadata(source: str, metadata: dict[str, str] | None) -> None:
+    with _admin_database() as connection:
+        if metadata is None:
+            connection.execute(
+                "DELETE FROM document_metadata WHERE source = ?", (source,)
+            )
+        else:
+            connection.execute(
+                """INSERT INTO document_metadata (source, title, updated_at)
+                VALUES (?, ?, ?)
+                ON CONFLICT(source) DO UPDATE SET
+                    title = excluded.title,
+                    updated_at = excluded.updated_at""",
+                (source, metadata["title"], metadata["updated_at"]),
+            )
+
+
+def _replace_file_contents(path: Path, content: bytes) -> None:
+    temporary_path = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        temporary_path.write_bytes(content)
+        temporary_path.replace(path)
+    finally:
+        temporary_path.unlink(missing_ok=True)
 
 
 def _iter_table_paragraphs(table: Table):
@@ -749,18 +806,33 @@ def delete_admin(username: str, request: Request):
 @app.get("/api/documents")
 def list_documents(response: Response):
     documents = []
+    paths_by_source = {}
     for directory in (ORIGINAL_DIR, UPLOAD_DIR):
-        if not directory.exists():
-            continue
-        for path in directory.iterdir():
-            if path.is_file() and path.suffix.lower() in ALLOWED_EXTENSIONS:
-                documents.append({
-                    "title": path.name,
-                    "description": "Доступен для поиска в чате.",
-                    "date": datetime.fromtimestamp(path.stat().st_mtime).strftime("%d.%m.%Y"),
-                    "source": path.name,
-                    "indexed": True,
-                })
+        if directory.exists():
+            for path in directory.iterdir():
+                if path.is_file() and path.suffix.lower() in ALLOWED_EXTENSIONS:
+                    paths_by_source[path.name] = path
+    with _admin_database() as connection:
+        metadata_by_source = {
+            row["source"]: dict(row)
+            for row in connection.execute(
+                "SELECT source, title, updated_at FROM document_metadata"
+            )
+        }
+    for source, path in paths_by_source.items():
+        metadata = metadata_by_source.get(source)
+        documents.append({
+            "title": metadata["title"] if metadata else path.name,
+            "description": "Доступен для поиска в чате.",
+            "date": (
+                metadata["updated_at"]
+                if metadata
+                else datetime.fromtimestamp(path.stat().st_mtime).strftime("%d.%m.%Y")
+            ),
+            "source": path.name,
+            "indexed": True,
+            "uploaded": path.parent.resolve() == UPLOAD_DIR.resolve(),
+        })
     documents.sort(key=lambda item: item["title"].lower())
     response.headers["Cache-Control"] = "no-store"
     result: dict[str, object] = {"documents": documents}
@@ -1061,10 +1133,11 @@ def upload_document(
 
     UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
     target_path = UPLOAD_DIR / filename
-    if target_path.exists():
+    original_path = ORIGINAL_DIR / filename
+    if target_path.exists() or original_path.is_file():
         raise HTTPException(
             status_code=409,
-            detail="Файл с таким именем уже загружен. Переименуйте новый файл и повторите загрузку.",
+            detail="Документ с таким именем уже есть в базе. Обновлять существующие документы может только супер-администратор.",
         )
 
     try:
@@ -1084,6 +1157,8 @@ def upload_document(
 
     document_id = str(uuid.uuid4())
     clean_title = re.sub(r"[\r\n\t]+", " ", title).strip() or Path(filename).stem
+    if len(clean_title) > 200:
+        raise HTTPException(status_code=400, detail="Название документа не должно превышать 200 символов.")
     version = extract_version(text)
     metadatas = [{
         "source": filename,
@@ -1094,37 +1169,234 @@ def upload_document(
         "file_path": str(target_path),
         "document_id": document_id,
     } for index, chunk in enumerate(chunks)]
-    ids = [f"{document_id}-{index}" for index in range(len(chunks))]
+    ids = [str(uuid.uuid4()) for _ in chunks]
 
-    try:
-        target_path.write_bytes(content)
-        vector_store = QdrantVectorStore.from_existing_collection(
-            embedding=get_embeddings(),
-            collection_name=ACTIVE_COLLECTION_NAME,
-            url=QDRANT_URL,
-            trust_env=False,
-        )
-        vector_store.add_texts(texts=chunks, metadatas=metadatas, ids=ids)
-    except Exception as exc:
-        target_path.unlink(missing_ok=True)
-        logger.exception("Document indexing failed for %s", filename)
-        raise HTTPException(
-            status_code=503 if _embedding_quota_error_detail(exc) else 502,
-            detail=_embedding_quota_error_detail(exc)
-            or "Не удалось проиндексировать документ. Проверьте доступность Qdrant и API эмбеддингов.",
-        ) from exc
+    with DOCUMENT_INDEX_LOCK:
+        if target_path.exists() or original_path.is_file():
+            raise HTTPException(
+                status_code=409,
+                detail="Документ с таким именем уже есть в базе. Обновлять существующие документы может только супер-администратор.",
+            )
+        try:
+            target_path.write_bytes(content)
+            _set_document_metadata(filename, clean_title)
+            vector_store = QdrantVectorStore.from_existing_collection(
+                embedding=get_embeddings(),
+                collection_name=ACTIVE_COLLECTION_NAME,
+                url=QDRANT_URL,
+                trust_env=False,
+            )
+            vector_store.add_texts(texts=chunks, metadatas=metadatas, ids=ids)
+        except Exception as exc:
+            target_path.unlink(missing_ok=True)
+            _restore_document_metadata(filename, None)
+            logger.exception("Document indexing failed for %s", filename)
+            raise HTTPException(
+                status_code=503 if _embedding_quota_error_detail(exc) else 502,
+                detail=_embedding_quota_error_detail(exc)
+                or "Не удалось проиндексировать документ. Проверьте доступность Qdrant и API эмбеддингов.",
+            ) from exc
 
     return {
         "document": {
-            "title": filename,
+            "title": clean_title,
             "description": "Загружен и проиндексирован для поиска в чате.",
             "date": datetime.now().strftime("%d.%m.%Y"),
             "source": filename,
             "indexed": True,
+            "uploaded": True,
         },
         "chunks": len(chunks),
         "message": f"Документ проиндексирован: {len(chunks)} фрагментов.",
     }
+
+
+@app.put("/api/documents/{filename}")
+def update_document(
+    filename: str,
+    request: Request,
+    file: UploadFile = File(...),
+    title: str = Form(""),
+):
+    _require_superadmin(request)
+    target_path = _source_file(filename)
+    if target_path.is_symlink():
+        raise HTTPException(status_code=400, detail="Нельзя обновлять документ, являющийся символической ссылкой.")
+    if target_path.suffix.lower() != ".docx":
+        raise HTTPException(
+            status_code=400,
+            detail="Обновлять можно только документы DOCX.",
+        )
+
+    uploaded_filename = Path((file.filename or "").replace("\\", "/")).name
+    if Path(uploaded_filename).suffix.lower() != ".docx":
+        raise HTTPException(status_code=400, detail="Для обновления выберите файл DOCX.")
+    content = file.file.read(MAX_UPLOAD_SIZE + 1)
+    if len(content) > MAX_UPLOAD_SIZE:
+        raise HTTPException(
+            status_code=413,
+            detail=f"Размер файла превышает {MAX_UPLOAD_SIZE // (1024 * 1024)} МБ.",
+        )
+    if not content:
+        raise HTTPException(status_code=400, detail="Файл пуст.")
+
+    try:
+        text = read_docx_bytes(content)
+    except Exception as exc:
+        raise HTTPException(
+            status_code=400,
+            detail="Не удалось прочитать DOCX. Проверьте, что файл не повреждён.",
+        ) from exc
+
+    sensitive_fields = _find_sensitive_data(text)
+    if sensitive_fields:
+        detected = ", ".join(sensitive_fields)
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Обновление остановлено: в документе обнаружены возможные персональные "
+                f"данные ({detected}). Файл не сохранён и не отправлен сервису эмбеддингов. "
+                "Проверьте документ вручную и загрузите версию без персональных данных."
+            ),
+        )
+    if not create_splitter().split_text(text):
+        raise HTTPException(status_code=400, detail="В файле не найден текст для индексации.")
+
+    requested_title = re.sub(r"[\r\n\t]+", " ", title).strip()
+    if len(requested_title) > 200:
+        raise HTTPException(
+            status_code=400,
+            detail="Название документа не должно превышать 200 символов.",
+        )
+
+    with DOCUMENT_INDEX_LOCK:
+        source_path = _source_file(filename)
+        if source_path.is_symlink():
+            raise HTTPException(
+                status_code=400,
+                detail="Нельзя обновлять документ, являющийся символической ссылкой.",
+            )
+        if source_path.suffix.lower() != ".docx":
+            raise HTTPException(
+                status_code=400,
+                detail="Обновлять можно только документы DOCX.",
+            )
+        create_override = (
+            source_path.parent.resolve() == ORIGINAL_DIR.resolve()
+            and ORIGINAL_DIR.resolve() != UPLOAD_DIR.resolve()
+        )
+        target_path = UPLOAD_DIR / filename if create_override else source_path
+        previous_content = source_path.read_bytes()
+        previous_stat = source_path.stat()
+        previous_metadata = _get_document_metadata(filename)
+        clean_title = requested_title or (
+            previous_metadata["title"] if previous_metadata else source_path.name
+        )
+        try:
+            if create_override:
+                UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+            _replace_file_contents(target_path, content)
+            _set_document_metadata(filename, clean_title)
+            reindex_documents((ORIGINAL_DIR, UPLOAD_DIR), ADMIN_DATABASE)
+        except Exception as exc:
+            try:
+                if create_override:
+                    target_path.unlink(missing_ok=True)
+                else:
+                    _replace_file_contents(target_path, previous_content)
+                    os.utime(
+                        target_path,
+                        ns=(previous_stat.st_atime_ns, previous_stat.st_mtime_ns),
+                    )
+                _restore_document_metadata(filename, previous_metadata)
+            except Exception as rollback_error:
+                logger.exception(
+                    "Failed to restore document %s after update error",
+                    filename,
+                )
+                raise HTTPException(
+                    status_code=500,
+                    detail="Обновление не завершилось, и автоматический откат не удался. Проверьте файл на сервере.",
+                ) from rollback_error
+            logger.exception("Document update failed for %s; previous version restored", filename)
+            raise HTTPException(
+                status_code=502,
+                detail=(
+                    "Не удалось обновить индекс документов. Исходный файл восстановлен; "
+                    "проверьте доступность Qdrant и API эмбеддингов."
+                ),
+            ) from exc
+
+    metadata = _get_document_metadata(filename)
+    return {
+        "document": {
+            "title": metadata["title"] if metadata else target_path.name,
+            "description": "Документ обновлён и переиндексирован для поиска в чате.",
+            "date": (
+                metadata["updated_at"]
+                if metadata
+                else datetime.fromtimestamp(target_path.stat().st_mtime).strftime("%d.%m.%Y")
+            ),
+            "source": filename,
+            "indexed": True,
+            "uploaded": True,
+        },
+        "message": "Документ обновлён и переиндексирован.",
+    }
+
+
+@app.delete("/api/documents/{filename}", status_code=204)
+def delete_uploaded_document(filename: str, request: Request):
+    _require_superadmin(request)
+    with DOCUMENT_INDEX_LOCK:
+        target_path = _source_file(filename)
+        if target_path.is_symlink():
+            raise HTTPException(
+                status_code=400,
+                detail="Нельзя удалить документ, являющийся символической ссылкой.",
+            )
+        if target_path.parent.resolve() != UPLOAD_DIR.resolve():
+            raise HTTPException(
+                status_code=400,
+                detail="Удалять через интерфейс можно только загруженные документы.",
+            )
+        previous_content = target_path.read_bytes()
+        previous_stat = target_path.stat()
+        previous_metadata = _get_document_metadata(filename)
+        try:
+            target_path.unlink()
+            _restore_document_metadata(filename, None)
+            reindex_documents((ORIGINAL_DIR, UPLOAD_DIR), ADMIN_DATABASE)
+        except Exception as exc:
+            try:
+                if not target_path.exists():
+                    target_path.parent.mkdir(parents=True, exist_ok=True)
+                    target_path.write_bytes(previous_content)
+                    os.utime(
+                        target_path,
+                        ns=(previous_stat.st_atime_ns, previous_stat.st_mtime_ns),
+                    )
+                _restore_document_metadata(filename, previous_metadata)
+            except Exception as rollback_error:
+                logger.exception(
+                    "Failed to restore deleted document %s after reindex error",
+                    filename,
+                )
+                raise HTTPException(
+                    status_code=500,
+                    detail="Не удалось перестроить индекс, и автоматическое восстановление файла не удалось.",
+                ) from rollback_error
+            logger.exception(
+                "Document deletion failed for %s; previous version restored",
+                filename,
+            )
+            raise HTTPException(
+                status_code=502,
+                detail=(
+                    "Не удалось удалить документ из индекса. Файл восстановлен; "
+                    "проверьте доступность Qdrant и API эмбеддингов."
+                ),
+            ) from exc
 
 
 @app.post("/api/documents/check")

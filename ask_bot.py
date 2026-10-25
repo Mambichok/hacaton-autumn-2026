@@ -1,5 +1,7 @@
 import os
 import re
+from pathlib import Path
+
 from openai import OpenAI
 from dotenv import load_dotenv
 from langchain_openai import OpenAIEmbeddings
@@ -99,6 +101,11 @@ def _parse_source_citations(response: str, docs) -> tuple[str, list[dict[str, st
     return answer, _source_metadata(cited_docs)
 
 
+def _document_file_exists(document) -> bool:
+    file_path = document.metadata.get("file_path")
+    return not file_path or Path(file_path).is_file()
+
+
 def _call_model(system_prompt: str, user_message: str, max_tokens: int = 1100) -> str:
     response = get_llm_client().chat.completions.create(
         model=MODEL_NAME,
@@ -142,7 +149,11 @@ def ask_bot(question: str, history: list[dict[str, str]] | None = None) -> dict:
         )
     except Exception as exc:
         raise BotServiceError("search", exc) from exc
-    docs = [doc for doc, score in docs_with_scores if score >= RELEVANCE_THRESHOLD]
+    docs = [
+        doc
+        for doc, score in docs_with_scores
+        if score >= RELEVANCE_THRESHOLD and _document_file_exists(doc)
+    ]
 
     if not docs:
         return {
@@ -215,7 +226,8 @@ def review_draft(text: str) -> dict:
                     doc.metadata.get("source", ""),
                     doc.metadata.get("chunk", doc.page_content[:100]),
                 )
-                docs_by_key.setdefault(key, doc)
+                if _document_file_exists(doc):
+                    docs_by_key.setdefault(key, doc)
     except Exception as exc:
         raise BotServiceError("search", exc) from exc
     docs = list(docs_by_key.values())[:12]

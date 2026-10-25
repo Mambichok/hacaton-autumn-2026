@@ -1,5 +1,6 @@
 import os
 import re
+import sqlite3
 import uuid
 from io import BytesIO
 from pathlib import Path
@@ -32,6 +33,12 @@ UPLOAD_DIR = Path(os.getenv("DOCUMENTS_UPLOAD_DIR", "documents/uploaded"))
 COLLECTION_NAME = os.getenv("QDRANT_COLLECTION", "documents")
 ACTIVE_COLLECTION_NAME = f"{COLLECTION_NAME}_active"
 QDRANT_URL = os.getenv("QDRANT_URL", "http://localhost:6333")
+ADMIN_DATABASE = Path(
+    os.getenv(
+        "ADMIN_DATABASE_PATH",
+        str(Path(__file__).resolve().parent / "documents" / "admins.sqlite3"),
+    )
+)
 
 
 def get_embeddings() -> OpenAIEmbeddings:
@@ -203,21 +210,42 @@ def replace_active_collection(
             )
 
 
-def get_document_files() -> list[Path]:
+def get_document_files(directories: tuple[Path, ...] | None = None) -> list[Path]:
+    source_directories = (
+        directories if directories is not None else (DOCUMENTS_DIR, UPLOAD_DIR)
+    )
+    files_by_name: dict[str, Path] = {}
+    for directory in source_directories:
+        if not directory.exists():
+            continue
+        for file in directory.iterdir():
+            if file.is_file() and file.suffix.lower() in {".docx", ".pdf"}:
+                files_by_name[file.name] = file
     return sorted(
-        (
-            file
-            for directory in (DOCUMENTS_DIR, UPLOAD_DIR)
-            if directory.exists()
-            for file in directory.iterdir()
-            if file.is_file() and file.suffix.lower() in {".docx", ".pdf"}
-        ),
+        files_by_name.values(),
         key=lambda file: (file.name.lower(), str(file.parent).lower()),
     )
 
 
-def main():
-    files = get_document_files()
+def get_document_titles(database: Path = ADMIN_DATABASE) -> dict[str, str]:
+    if not database.exists():
+        return {}
+    with sqlite3.connect(database) as connection:
+        table = connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'document_metadata'"
+        ).fetchone()
+        if not table:
+            return {}
+        return dict(
+            connection.execute("SELECT source, title FROM document_metadata").fetchall()
+        )
+
+
+def reindex_documents(
+    directories: tuple[Path, ...] | None = None,
+    metadata_database: Path = ADMIN_DATABASE,
+) -> int:
+    files = get_document_files(directories)
     if not files:
         raise FileNotFoundError(
             "В папках исходных и загруженных документов не найдено ни одного DOCX или PDF: "
@@ -228,6 +256,7 @@ def main():
 
     texts = []
     metadatas = []
+    titles = get_document_titles(metadata_database)
 
     for file in files:
         print(f"Читаю: {file.name}")
@@ -246,6 +275,7 @@ def main():
             texts.append(chunk)
             metadatas.append({
                 "source": file.name,
+                "title": titles.get(file.name, file.name),
                 "version": version,
                 "reference": extract_reference(chunk),
                 "chunk": i,
@@ -261,10 +291,14 @@ def main():
     client = QdrantClient(url=QDRANT_URL, trust_env=False)
 
     replace_active_collection(client, texts, metadatas, embeddings)
+    return len(texts)
 
+
+def main():
+    indexed_count = reindex_documents()
     print(
         "Индексация завершена успешно. "
-        f"Активная база «{ACTIVE_COLLECTION_NAME}» содержит {len(texts)} фрагментов."
+        f"Активная база «{ACTIVE_COLLECTION_NAME}» содержит {indexed_count} фрагментов."
     )
 
 if __name__ == "__main__":
